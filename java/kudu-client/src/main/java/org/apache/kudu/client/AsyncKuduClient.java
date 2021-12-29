@@ -302,6 +302,7 @@ public class AsyncKuduClient implements AutoCloseable {
   public static final long NO_TIMESTAMP = -1;
   public static final long INVALID_TXN_ID = -1;
   public static final long DEFAULT_OPERATION_TIMEOUT_MS = 30000;
+  public static final int DEFAULT_TRASHTABLE_RESERVED_SECONDS = 60 * 60 * 24 * 7;
   public static final long DEFAULT_KEEP_ALIVE_PERIOD_MS = 15000; // 25% of the default scanner ttl.
   private static final long MAX_RPC_ATTEMPTS = 100;
 
@@ -392,6 +393,8 @@ public class AsyncKuduClient implements AutoCloseable {
 
   private final long defaultOperationTimeoutMs;
 
+  private final int defaultTrashTableReservedSeconds;
+
   private final long defaultAdminOperationTimeoutMs;
 
   private final Statistics statistics;
@@ -417,6 +420,7 @@ public class AsyncKuduClient implements AutoCloseable {
     this.masterTable = new KuduTable(this, MASTER_TABLE_NAME_PLACEHOLDER,
         MASTER_TABLE_NAME_PLACEHOLDER, null, null, 1, null, null, null);
     this.defaultOperationTimeoutMs = b.defaultOperationTimeoutMs;
+    this.defaultTrashTableReservedSeconds = b.defaultTrashTableReservedSeconds;
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
     this.statisticsDisabled = b.statisticsDisabled;
     this.statistics = statisticsDisabled ? null : new Statistics();
@@ -695,17 +699,59 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Delete a table on the cluster with the specified name.
+   * SoftDelete a table on the cluster with the specified name, the table will be
+   * reserved for 7 days after being deleted.
    * @param name the table's name
    * @return a deferred object to track the progress of the deleteTable command
    */
   public Deferred<DeleteTableResponse> deleteTable(String name) {
+    return deleteTable(name, false, this.defaultTrashTableReservedSeconds);
+  }
+
+  /**
+   * Delete a table on the cluster with the specified name.
+   * @param name the table's name
+   * @param forceOnTrashedTable the flag to decide whether to trash table
+   * @param reserveSeconds the trashed table to be alive time
+   * @return a deferred object to track the progress of the deleteTable command
+   */
+  public Deferred<DeleteTableResponse> deleteTable(String name,
+                                                   boolean forceOnTrashedTable,
+                                                   int reserveSeconds) {
     checkIsClosed();
     DeleteTableRequest delete = new DeleteTableRequest(this.masterTable,
                                                        name,
                                                        timer,
-                                                       defaultAdminOperationTimeoutMs);
+                                                       defaultAdminOperationTimeoutMs,
+                                                       forceOnTrashedTable,
+                                                       reserveSeconds);
     return sendRpcToTablet(delete);
+  }
+
+  /**
+   * Recall a deleted table on the cluster with the specified id
+   * @param id the table's id
+   * @return a deferred object to track the progress of the recall command
+   */
+  public Deferred<RecallDeletedTableResponse> recallDeletedTable(String id) {
+    return recallDeletedTable(id, "");
+  }
+
+  /**
+   * Recall a deleted table on the cluster with the specified id
+   * @param id the table's id
+   * @param newTableName the table's new name after recall
+   * @return a deferred object to track the progress of the recall command
+   */
+  public Deferred<RecallDeletedTableResponse> recallDeletedTable(String id,
+                                                                 String newTableName) {
+    checkIsClosed();
+    RecallDeletedTableRequest recall = new RecallDeletedTableRequest(this.masterTable,
+                                                      id,
+                                                      newTableName,
+                                                      timer,
+                                                      defaultAdminOperationTimeoutMs);
+    return sendRpcToTablet(recall);
   }
 
   /**
@@ -1109,6 +1155,14 @@ public class AsyncKuduClient implements AutoCloseable {
    */
   public long getDefaultOperationTimeoutMs() {
     return defaultOperationTimeoutMs;
+  }
+
+  /**
+   * Get the reserve time used for trash table.
+   * @return a reserve time in seconds
+   */
+  public int getDefaultTrashTableReservedSeconds() {
+    return defaultTrashTableReservedSeconds;
   }
 
   /**
@@ -2764,6 +2818,7 @@ public class AsyncKuduClient implements AutoCloseable {
     private final List<HostAndPort> masterAddresses;
     private long defaultAdminOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
     private long defaultOperationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS;
+    private int defaultTrashTableReservedSeconds = DEFAULT_TRASHTABLE_RESERVED_SECONDS;
 
     private final HashedWheelTimer timer = new HashedWheelTimer(
         new ThreadFactoryBuilder().setDaemon(true).build(), 20, MILLISECONDS);
@@ -2830,6 +2885,19 @@ public class AsyncKuduClient implements AutoCloseable {
      */
     public AsyncKuduClientBuilder defaultOperationTimeoutMs(long timeoutMs) {
       this.defaultOperationTimeoutMs = timeoutMs;
+      return this;
+    }
+
+    /**
+     * Sets the default reserve time used for delete operations.
+     * Optional.
+     * If not provided, defaults to 60 * 60 * 24 * 7s (7 days).
+     * A value of 0 disables the reserved trash table and delete table directly.
+     * @param reserveSeconds a reserve time in seconds
+     * @return this builder
+     */
+    public AsyncKuduClientBuilder defaultTrashTableReservedSeconds(int reserveSeconds) {
+      this.defaultTrashTableReservedSeconds = reserveSeconds;
       return this;
     }
 

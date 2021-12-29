@@ -1635,7 +1635,9 @@ TEST_F(AdminCliTest, TestDeleteTable) {
     "table",
     "delete",
     master_address,
-    kTableId
+    kTableId,
+    "-force_on_trashed_table=false",
+    "-reserve_seconds=0"
   );
 
   vector<string> tables;
@@ -1649,16 +1651,31 @@ TEST_F(AdminCliTest, TestListTables) {
 
   NO_FATALS(BuildAndStart());
 
-  string stdout;
-  ASSERT_OK(RunKuduTool({
-    "table",
-    "list",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &stdout));
+  {
+    string stdout;
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
 
-  vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-  ASSERT_EQ(1, stdout_lines.size());
-  ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+  }
+
+  {
+    string stdout;
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      "-show_trash=true",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
+
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(0, stdout_lines.size());
+  }
 }
 
 TEST_F(AdminCliTest, TestListTablesDetail) {

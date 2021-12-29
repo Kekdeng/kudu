@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
+
 #include "kudu/client/authz_token_cache.h"
 #include "kudu/client/client.h"
 #include "kudu/gutil/macros.h"
@@ -38,6 +40,8 @@
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
+
+DECLARE_uint32(trash_table_reserved_seconds);
 
 namespace kudu {
 
@@ -119,7 +123,14 @@ class KuduClient::Data {
   static Status DeleteTable(KuduClient* client,
                             const std::string& table_name,
                             const MonoTime& deadline,
-                            bool modify_external_catalogs = true);
+                            bool modify_external_catalogs = true,
+                            bool force_on_trashed_table = false,
+                            uint32_t reserve_seconds = FLAGS_trash_table_reserved_seconds);
+
+  static Status RecallTable(KuduClient* client,
+                     const std::string& table_id,
+                     const MonoTime& deadline,
+                     const std::string& new_table_name = "");
 
   static Status AlterTable(KuduClient* client,
                            const master::AlterTableRequestPB& req,
@@ -144,7 +155,8 @@ class KuduClient::Data {
   };
   static Status ListTablesWithInfo(KuduClient* client,
                                    std::vector<TableInfo>* tables_info,
-                                   const std::string& filter);
+                                   const std::string& filter,
+                                   bool show_trash = false);
 
   // Open the table identified by 'table_identifier'.
   Status OpenTable(KuduClient* client,

@@ -149,7 +149,7 @@ public class TestAuthTokenReacquire {
             dropConnectionsAndExpireTokens();
 
             try {
-              client.deleteTable(tableName);
+              client.deleteTable(tableName, false, 0);
             } catch (KuduException ex) {
               // See the above comment about table creation.
               // The same idea applies to table deletion.
@@ -250,7 +250,7 @@ public class TestAuthTokenReacquire {
     // Force the client to get a new authn token and delete the table.
     originalToken = asyncClient.securityContext.getAuthenticationToken();
     dropConnectionsAndExpireTokens();
-    client.deleteTable(TABLE_NAME);
+    client.deleteTable(TABLE_NAME, false, 0);
     assertFalse(client.tableExists(TABLE_NAME));
     assertFalse(asyncClient.securityContext.getAuthenticationToken().equals(originalToken));
   }

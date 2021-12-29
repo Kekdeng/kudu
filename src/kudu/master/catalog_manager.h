@@ -37,6 +37,7 @@
 #include <sparsehash/dense_hash_map>
 
 #include "kudu/common/partition.h"
+#include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/macros.h"
@@ -79,6 +80,7 @@ struct ColumnId;
 
 // Working around FRIEND_TEST() ugliness.
 namespace client {
+class ClientTest_TestSoftDeleteAndReserveTable_Test;
 class ServiceUnavailableRetryClientTest_CreateTable_Test;
 } // namespace client
 
@@ -289,6 +291,9 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   explicit TableInfo(std::string table_id);
 
   std::string ToString() const;
+
+  std::string table_name() const;
+
   uint32_t schema_version() const;
 
   // Return the table's ID. Does not require synchronization.
@@ -594,6 +599,12 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   void Shutdown();
 
+  enum TableInfoMapType {
+    kAllTableType,
+    kNormalTableType, // normalized_table_names_map_
+    kTrashTableType   // trash_table_names_map_
+  };
+
   // Create a new Table with the specified attributes.
   //
   // The RPC context is provded for logging/tracing purposes,
@@ -622,13 +633,22 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                         const std::string& table_id,
                         int64_t notification_log_event_id) WARN_UNUSED_RESULT;
 
+  // Recall a table in response to a RecallDeletedTableRequestPB RPC.
+  //
+  // The RPC context is provided for logging/tracing purposes,
+  // but this function does not itself respond to the RPC.
+  Status RecallDeletedTableRpc(const RecallDeletedTableRequestPB& req,
+                               RecallDeletedTableResponsePB* resp,
+                               rpc::RpcContext* rpc) WARN_UNUSED_RESULT;
+
   // Alter the specified table in response to an AlterTableRequest RPC.
   //
   // The RPC context is provided for logging/tracing purposes,
   // but this function does not itself respond to the RPC.
   Status AlterTableRpc(const AlterTableRequestPB& req,
                        AlterTableResponsePB* resp,
-                       rpc::RpcContext* rpc);
+                       rpc::RpcContext* rpc,
+                       ExternalRequestState external_request_state);
 
   // Alter the specified table in response to an 'ALTER TABLE' HMS
   // notification log listener event.
@@ -652,7 +672,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status GetTableSchema(const GetTableSchemaRequestPB* req,
                         GetTableSchemaResponsePB* resp,
                         boost::optional<const std::string&> user,
-                        const security::TokenSigner* token_signer);
+                        const security::TokenSigner* token_signer,
+                        TableInfoMapType map_type = kNormalTableType);
 
   // Lists all the running tables. If 'user' is provided, only lists those that
   // the given user is authorized to see.
@@ -836,8 +857,25 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status InitiateMasterChangeConfig(ChangeConfigOp op, const HostPort& hp,
                                     const std::string& uuid, rpc::RpcContext* rpc);
 
+  // Check whether the table is trashed and outdated.
+  Status IsOutdatedTable(const TableIdentifierPB& table_identifier,
+                         bool* is_trashed_table,
+                         bool* is_outdated_table = nullptr,
+                         TableInfoMapType map_type = kAllTableType);
+
+  // Move the deleted table to trash map for keep it temporarily.
+  Status MoveToTrashContainer(const std::string& table_name);
+
+  // Move the trash table to normal map for recall.
+  Status MoveToNormalContainer(const std::string& table_id, std::string* table_name);
+
+  // Use for seach table with table name.
+  scoped_refptr<TableInfo> FindTableWithName(const std::string& table_name,
+                                             TableInfoMapType map_type = kAllTableType);
+
  private:
   // These tests call ElectedAsLeaderCb() directly.
+  FRIEND_TEST(kudu::client::ClientTest, TestSoftDeleteAndReserveTable);
   FRIEND_TEST(MasterTest, TestShutdownDuringTableVisit);
   FRIEND_TEST(MasterTest, TestGetTableLocationsDuringRepeatedTableVisit);
   FRIEND_TEST(kudu::AuthzTokenTest, TestSingleMasterUnavailable);
@@ -848,6 +886,9 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // This test exclusively acquires the leader_lock_ directly.
   FRIEND_TEST(kudu::client::ServiceUnavailableRetryClientTest, CreateTable);
 
+  // This test call GetOriginNameAndDeleteTimeOfTrashedTable directly.
+  FRIEND_TEST(MasterTest, TestGetOriginNameAndDeleteTimeOfTrashedTable);
+
   friend class AutoRebalancerTest;
   friend class TableLoader;
   friend class TabletLoader;
@@ -857,7 +898,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   // Check whether the table's write limit is reached,
   // if true, the write permission should be disabled.
-  static bool IsTableWriteDisabled(const scoped_refptr<TableInfo>& table,
+  bool IsTableWriteDisabled(const scoped_refptr<TableInfo>& table,
                                    const std::string& table_name);
 
   // Delete the specified table in the catalog. If 'user' is provided,
@@ -882,7 +923,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   Status AlterTable(const AlterTableRequestPB& req,
                     AlterTableResponsePB* resp,
                     boost::optional<int64_t> hms_notification_log_event_id,
-                    boost::optional<const std::string&> user) WARN_UNUSED_RESULT;
+                    boost::optional<const std::string&> user,
+                    ExternalRequestState external_request_state) WARN_UNUSED_RESULT;
 
   // Called by SysCatalog::SysCatalogStateChanged when this node
   // becomes the leader of a consensus configuration. Executes
@@ -1032,7 +1074,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
                                    F authz_func,
                                    boost::optional<const std::string&> user,
                                    scoped_refptr<TableInfo>* table_info,
-                                   TableMetadataLock* table_lock) WARN_UNUSED_RESULT;
+                                   TableMetadataLock* table_lock,
+                                   TableInfoMapType map_type = kAllTableType) WARN_UNUSED_RESULT;
 
   // Extract the set of tablets that must be processed because not running yet.
   void ExtractTabletsToProcess(std::vector<scoped_refptr<TabletInfo>>* tablets_to_process);
@@ -1055,8 +1098,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // container must not be empty.
   Status DeleteTskEntries(const std::set<std::string>& entry_ids);
 
-  Status ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
-                               std::vector<AlterTableRequestPB::Step> steps,
+  static Status ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
+                               const std::vector<AlterTableRequestPB::Step>& steps,
                                Schema* new_schema,
                                ColumnId* next_col_id);
 
@@ -1164,6 +1207,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Table maps: table-id -> TableInfo and normalized-table-name -> TableInfo
   TableInfoMap table_ids_map_;
   TableInfoMap normalized_table_names_map_;
+  // Table maps: trash-table-name -> TableInfo
+  TableInfoMap trash_table_names_map_;
 
   // Tablet maps: tablet-id -> TabletInfo
   TabletInfoMap tablet_map_;

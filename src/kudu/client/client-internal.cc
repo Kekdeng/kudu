@@ -32,7 +32,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/vector.hpp>
-#include <gflags/gflags_declare.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 
@@ -69,6 +69,10 @@
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/openssl_util.h"
 #include "kudu/util/thread_restrictions.h"
+
+DEFINE_uint32(trash_table_reserved_seconds, 60 * 60 * 24 * 7,
+             "Default reserved time for deleted table."
+             "A value of 0 disables the reserved trash table and delete table directly");
 
 DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
@@ -118,6 +122,31 @@ namespace kudu {
 namespace security {
 class SignedTokenPB;
 } // namespace security
+
+using master::AlterTableRequestPB;
+using master::AlterTableResponsePB;
+using master::ConnectToMasterResponsePB;
+using master::CreateTableRequestPB;
+using master::CreateTableResponsePB;
+using master::DeleteTableRequestPB;
+using master::DeleteTableResponsePB;
+using master::GetTableSchemaRequestPB;
+using master::GetTableSchemaResponsePB;
+using master::IsAlterTableDoneRequestPB;
+using master::IsAlterTableDoneResponsePB;
+using master::IsCreateTableDoneRequestPB;
+using master::IsCreateTableDoneResponsePB;
+using master::ListTabletServersResponsePB;
+using master::ListTabletServersRequestPB;
+using master::RecallDeletedTableRequestPB;
+using master::RecallDeletedTableResponsePB;
+using master::MasterFeatures;
+using master::MasterServiceProxy;
+using master::TableIdentifierPB;
+using rpc::BackoffType;
+using rpc::CredentialsPolicy;
+using security::SignedTokenPB;
+using strings::Substitute;
 
 namespace client {
 
@@ -369,16 +398,40 @@ Status KuduClient::Data::WaitForCreateTableToFinish(
 Status KuduClient::Data::DeleteTable(KuduClient* client,
                                      const string& table_name,
                                      const MonoTime& deadline,
-                                     bool modify_external_catalogs) {
+                                     bool modify_external_catalogs,
+                                     bool force_on_trashed_table,
+                                     uint32_t reserve_seconds) {
   DeleteTableRequestPB req;
   DeleteTableResponsePB resp;
 
   req.mutable_table()->set_table_name(table_name);
   req.set_modify_external_catalogs(modify_external_catalogs);
+  req.set_force_on_trashed_table(force_on_trashed_table);
+  req.set_reserve_seconds(reserve_seconds);
   Synchronizer sync;
   AsyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB> rpc(
       deadline, client, BackoffType::EXPONENTIAL, req, &resp,
       &MasterServiceProxy::DeleteTableAsync, "DeleteTable", sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  return sync.Wait();
+}
+
+Status KuduClient::Data::RecallTable(KuduClient* client,
+                                     const std::string& table_id,
+                                     const MonoTime& deadline,
+                                     const std::string& new_table_name) {
+  RecallDeletedTableRequestPB req;
+  RecallDeletedTableResponsePB resp;
+
+  req.mutable_table()->set_table_id(table_id);
+  if (!new_table_name.empty()) {
+    req.set_new_table_name(new_table_name);
+  }
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<RecallDeletedTableRequestPB, RecallDeletedTableResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::RecallDeletedTableAsync, "RecallDeletedTable", sync.AsStatusCallback(),
+      {});
   rpc.SendRpc();
   return sync.Wait();
 }
@@ -436,11 +489,13 @@ Status KuduClient::Data::WaitForAlterTableToFinish(
 
 Status KuduClient::Data::ListTablesWithInfo(KuduClient* client,
                                             vector<TableInfo>* tables_info,
-                                            const string& filter) {
+                                            const string& filter,
+                                            bool show_trash) {
   ListTablesRequestPB req;
   if (!filter.empty()) {
     req.set_name_filter(filter);
   }
+  req.set_show_trash(show_trash);
 
   auto deadline = MonoTime::Now() + client->default_admin_operation_timeout();
   Synchronizer sync;

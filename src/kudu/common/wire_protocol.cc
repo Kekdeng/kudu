@@ -23,8 +23,8 @@
 #include <cstdint>
 #include <cstring>
 #include <ostream>
+#include <set>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -68,8 +68,8 @@ using google::protobuf::RepeatedPtrField;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using std::map;
+using std::set;
 using std::string;
-using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -666,38 +666,80 @@ Status ParseInt32Config(const string& name, const string& value, int32_t* result
   return Status::OK();
 }
 
-static const std::string kTableHistoryMaxAgeSec = "kudu.table.history_max_age_sec";
-static const std::string kTableMaintenancePriority = "kudu.table.maintenance_priority";
+Status ParseUint32Config(const string& name, const string& value, uint32_t* result) {
+  CHECK(result);
+  if (!safe_strtou32(value, result)) {
+    return Status::InvalidArgument(Substitute("unable to parse $0", name), value);
+  }
+  return Status::OK();
+}
 
-Status ExtraConfigPBFromPBMap(const Map<string, string>& configs, TableExtraConfigPB* pb) {
-  static const unordered_set<string> kSupportedConfigs({kTableHistoryMaxAgeSec,
-                                                        kTableMaintenancePriority});
-  TableExtraConfigPB result;
-  for (const auto& config : configs) {
+Status ParseInt64Config(const string& name, const string& value, int64_t* result) {
+  CHECK(result);
+  if (!safe_strto64(value, result)) {
+    return Status::InvalidArgument(Substitute("unable to parse $0", name), value);
+  }
+  return Status::OK();
+}
+
+Status UpdateExtraConfigPB(const Map<string, string>& new_extra_configs,
+                           ExternalRequestState external_request_state,
+                           TableExtraConfigPB* pb) {
+  static const set<string> kSupportedConfigs({kTableHistoryMaxAgeSec,
+                                              kTableMaintenancePriority,
+                                              kTableConfigReserveSeconds,
+                                              kTableConfigTrashStateTimestamp});
+  static const set<string> kInternalConfigs({kTableConfigReserveSeconds,
+                                             kTableConfigTrashStateTimestamp});
+
+  for (const auto& config : new_extra_configs) {
     const string& name = config.first;
     const string& value = config.second;
     if (!ContainsKey(kSupportedConfigs, name)) {
       return Status::InvalidArgument(
-          Substitute("invalid extra configuration property: $0", name));
+        Substitute("invalid extra configuration property: $0", name));
+    }
+    if (external_request_state && ContainsKey(kInternalConfigs, name)) {
+      return Status::InvalidArgument(
+        Substitute("forbidden to change internal extra configuration by user, property: $0", name));
     }
 
     if (name == kTableHistoryMaxAgeSec) {
       if (!value.empty()) {
         int32_t history_max_age_sec;
         RETURN_NOT_OK(ParseInt32Config(name, value, &history_max_age_sec));
-        result.set_history_max_age_sec(history_max_age_sec);
+        pb->set_history_max_age_sec(history_max_age_sec);
+      } else {
+        pb->clear_history_max_age_sec();
       }
     } else if (name == kTableMaintenancePriority) {
       if (!value.empty()) {
         int32_t maintenance_priority;
         RETURN_NOT_OK(ParseInt32Config(name, value, &maintenance_priority));
-        result.set_maintenance_priority(maintenance_priority);
+        pb->set_maintenance_priority(maintenance_priority);
+      } else {
+        pb->clear_maintenance_priority();
+      }
+    } else if (name == kTableConfigReserveSeconds) {
+      if (!value.empty()) {
+        uint32_t reserve_seconds;
+        RETURN_NOT_OK(ParseUint32Config(name, value, &reserve_seconds));
+        pb->set_reserve_seconds(reserve_seconds);
+      } else {
+        pb->clear_reserve_seconds();
+      }
+    } else if (name == kTableConfigTrashStateTimestamp) {
+      if (!value.empty()) {
+        int64_t trash_timestamp;
+        RETURN_NOT_OK(ParseInt64Config(name, value, &trash_timestamp));
+        pb->set_trash_state_timestamp(trash_timestamp);
+      } else {
+        pb->clear_trash_state_timestamp();
       }
     } else {
       LOG(FATAL) << "Unknown extra configuration property: " << name;
     }
   }
-  *pb = std::move(result);
   return Status::OK();
 }
 
@@ -708,6 +750,12 @@ Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb, Map<string, string>* c
   }
   if (pb.has_maintenance_priority()) {
     result[kTableMaintenancePriority] = std::to_string(pb.maintenance_priority());
+  }
+  if (pb.has_reserve_seconds()) {
+    result[kTableConfigReserveSeconds] = std::to_string(pb.reserve_seconds());
+  }
+  if (pb.has_trash_state_timestamp()) {
+    result[kTableConfigTrashStateTimestamp] = std::to_string(pb.trash_state_timestamp());
   }
   *configs = std::move(result);
   return Status::OK();

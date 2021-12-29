@@ -506,13 +506,27 @@ Status KuduClient::IsCreateTableInProgress(const string& table_name,
 }
 
 Status KuduClient::DeleteTable(const string& table_name) {
-  return DeleteTableInCatalogs(table_name, true);
+  return SoftDeleteTable(table_name);
+}
+
+Status KuduClient::SoftDeleteTable(const string& table_name,
+                               bool force_on_trashed_table,
+                               uint32_t reserve_seconds) {
+  return DeleteTableInCatalogs(table_name, true, force_on_trashed_table, reserve_seconds);
 }
 
 Status KuduClient::DeleteTableInCatalogs(const string& table_name,
-                                         bool modify_external_catalogs) {
+                                         bool modify_external_catalogs,
+                                         bool force_on_trashed_table,
+                                         uint32_t reserve_seconds) {
   MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
-  return data_->DeleteTable(this, table_name, deadline, modify_external_catalogs);
+  return  kudu::client::KuduClient::Data::DeleteTable(this, table_name, deadline,
+        modify_external_catalogs, force_on_trashed_table, reserve_seconds);
+}
+
+Status KuduClient::RecallTable(const string& table_id, const string& new_table_name) {
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
+  return kudu::client::KuduClient::Data::RecallTable(this, table_id, deadline, new_table_name);
 }
 
 KuduTableAlterer* KuduClient::NewTableAlterer(const string& table_name) {
@@ -561,13 +575,22 @@ Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) 
   return Status::OK();
 }
 
-Status KuduClient::ListTables(vector<string>* tables, const string& filter) {
+Status KuduClient::GetTables(vector<string>* tables, const string& filter, bool show_trash) {
   vector<Data::TableInfo> tables_info;
-  RETURN_NOT_OK(data_->ListTablesWithInfo(this, &tables_info, filter));
+  RETURN_NOT_OK(data_->ListTablesWithInfo(this, &tables_info, filter, show_trash));
+  tables->clear();
   for (auto& info : tables_info) {
     tables->emplace_back(std::move(info.table_name));
   }
   return Status::OK();
+}
+
+Status KuduClient::ListTables(vector<string>* tables, const string& filter) {
+  return GetTables(tables, filter, false);
+}
+
+Status KuduClient::ListTrashTables(vector<string>* tables, const string& filter) {
+  return GetTables(tables, filter, true);
 }
 
 Status KuduClient::TableExists(const string& table_name, bool* exists) {
@@ -1597,6 +1620,12 @@ KuduTableAlterer* KuduTableAlterer::wait(bool wait) {
 KuduTableAlterer* KuduTableAlterer::modify_external_catalogs(
     bool modify_external_catalogs) {
   data_->modify_external_catalogs_ = modify_external_catalogs;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::force_on_trashed_table(
+    bool force_on_trashed_table) {
+  data_->force_on_trashed_table_ = force_on_trashed_table;
   return this;
 }
 

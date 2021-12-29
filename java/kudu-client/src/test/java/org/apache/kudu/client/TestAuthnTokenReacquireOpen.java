@@ -118,7 +118,7 @@ public class TestAuthnTokenReacquireOpen {
         .build();
     assertEquals(0, countRowsInScan(scanner));
 
-    client.deleteTable(TABLE_NAME);
+    client.deleteTable(TABLE_NAME, false, 0);
     assertFalse(client.tableExists(TABLE_NAME));
   }
 }

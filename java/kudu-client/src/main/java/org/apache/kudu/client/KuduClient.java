@@ -162,13 +162,56 @@ public class KuduClient implements AutoCloseable {
   }
 
   /**
-   * Delete a table on the cluster with the specified name.
+   * SoftDelete a table on the cluster with the specified name, the table will be
+   * reserved for 7 days after being deleted.
    * @param name the table's name
    * @return an rpc response object
    * @throws KuduException if anything went wrong
    */
   public DeleteTableResponse deleteTable(String name) throws KuduException {
     Deferred<DeleteTableResponse> d = asyncClient.deleteTable(name);
+    return joinAndHandleException(d);
+  }
+
+  /**
+   * Delete a table on the cluster with the specified name.
+   * @param name the table's name
+   * @param forceOnTrashedTable the flag the decide whether to trash table
+   * @param reserveSeconds the trashed table to be alive time
+   * @return an rpc response object
+   * @throws KuduException if anything went wrong
+   */
+  public DeleteTableResponse deleteTable(String name,
+                                         boolean forceOnTrashedTable,
+                                         int reserveSeconds) throws KuduException {
+    Deferred<DeleteTableResponse> d = asyncClient.deleteTable(name,
+                                                forceOnTrashedTable, reserveSeconds);
+    return joinAndHandleException(d);
+  }
+
+  /**
+   * Recall a deleted table on the cluster with the specified table id
+   * @param id the table's id
+   * @return an rpc response object
+   * @throws KuduException if anything went wrong
+   */
+  public RecallDeletedTableResponse recallDeletedTable(String id) throws KuduException {
+    Deferred<RecallDeletedTableResponse> d = asyncClient.recallDeletedTable(id);
+    return joinAndHandleException(d);
+  }
+
+  /**
+   * Recall a deleted table on the cluster with the specified table id
+   * and rename the recalled table with new table name
+   * @param id the table's id
+   * @param newTableName the recalled table's new name
+   * @return an rpc response object
+   * @throws KuduException if anything went wrong
+   */
+  public RecallDeletedTableResponse recallDeletedTable(String id,
+                                                       String newTableName) throws KuduException {
+    Deferred<RecallDeletedTableResponse> d = asyncClient.recallDeletedTable(id,
+                                                         newTableName);
     return joinAndHandleException(d);
   }
 

@@ -1196,6 +1196,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "get_extra_configs.*Get the extra configuration properties for a table",
         "list.*List tables",
         "locate_row.*Locate which tablet a row belongs to",
+        "recall.*Recall a deleted but still reserved table",
         "rename_column.*Rename a column",
         "rename_table.*Rename a table",
         "scan.*Scan rows from a table",
@@ -4044,6 +4045,49 @@ TEST_F(ToolTest, TestRenameTable) {
         Substitute("table rename_table $0 $1 $2 --nomodify_external_catalogs",
           master_addr, kNewTableName, kTableName)));
   ASSERT_OK(client->OpenTable(kTableName, &table));
+}
+
+TEST_F(ToolTest, TestRecallTable) {
+  NO_FATALS(StartExternalMiniCluster());
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+
+  const string& kTableName = "kudu.table";
+
+  // Create the table.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_num_replicas(1);
+  workload.Setup();
+
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(kTableName, &table));
+  string table_id = table->id();
+
+  // Delete the table.
+  string out;
+  NO_FATALS(RunActionStdoutNone(Substitute("table delete $0 $1",
+                                           master_addr, kTableName)));
+
+  // List trashed table.
+  vector<string> kudu_tables;
+  client->ListTrashTables(&kudu_tables);
+  ASSERT_EQ(kudu_tables.size(), 1);
+  kudu_tables.clear();
+  client->ListTables(&kudu_tables);
+  ASSERT_EQ(kudu_tables.size(), 0);
+
+  const string kNewTableName = "kudu.table.new";
+  // Try to recall the trashed table with new name.
+  NO_FATALS(RunActionStdoutNone(Substitute("table recall $0 $1 --new_table_name=$2",
+                                           master_addr, table_id, kNewTableName)));
+
+  client->ListTables(&kudu_tables);
+  ASSERT_EQ(kudu_tables.size(), 1);
+  kudu_tables.clear();
+  client->ListTrashTables(&kudu_tables);
+  ASSERT_EQ(kudu_tables.size(), 0);
 }
 
 TEST_F(ToolTest, TestRenameColumn) {

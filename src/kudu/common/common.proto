@@ -472,6 +472,12 @@ message TableExtraConfigPB {
   // range [-FLAGS_max_priority_range, FLAGS_max_priority_range] when
   // calculate maintenance priority score.
   optional int32 maintenance_priority = 2;
+
+  // Reserve seconds after the table has been deleted.
+  optional uint32 reserve_seconds = 3;
+
+  // The timestamp for the table when it was deleted.
+  optional int64 trash_state_timestamp = 4;
 }
 
 // The type of a given table. This is useful in determining whether a
