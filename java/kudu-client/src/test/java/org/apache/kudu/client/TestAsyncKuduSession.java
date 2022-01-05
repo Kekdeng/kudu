@@ -141,7 +141,7 @@ public class TestAsyncKuduSession {
     String tabletId = rt.getTabletId();
     RpcProxy proxy = client.newRpcProxy(rt.getLeaderServerInfo());
     // Delete the table so subsequent writes fail with 'table not found'.
-    client.deleteTable(TABLE_NAME).join();
+    client.deleteTable(TABLE_NAME, false, 0).join();
     // Wait until the tablet is deleted on the TS.
     while (true) {
       ListTabletsRequest req = new ListTabletsRequest(client.getTimer(), 10000);

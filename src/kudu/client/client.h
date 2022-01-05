@@ -680,12 +680,27 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   Status IsCreateTableInProgress(const std::string& table_name,
                                  bool* create_in_progress);
 
-  /// Delete/drop a table.
+  /// Delete/drop a table without reserving.
+  /// In order to be compatible with the old version, will
+  /// call the SoftDeleteTable directly.
   ///
   /// @param [in] table_name
   ///   Name of the table to drop.
   /// @return Operation status.
   Status DeleteTable(const std::string& table_name);
+
+  /// Soft delete/drop a table.
+  ///
+  /// @param [in] table_name
+  ///   Name of the table to drop.
+  /// @param [in] force_on_trashed_table
+  ///   Whether to force to delete a trashed table.
+  /// @param [in] reserve_seconds
+  ///   Reserve seconds after being deleted.
+  /// @return Operation status.
+  Status SoftDeleteTable(const std::string& table_name,
+                         bool force_on_trashed_table = false,
+                         uint32_t reserve_seconds = 0);
 
   /// @cond PRIVATE_API
 
@@ -698,9 +713,23 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @param [in] modify_external_catalogs
   ///   Whether to apply the deletion to external catalogs, such as the Hive Metastore,
   ///   which the Kudu master has been configured to integrate with.
+  /// @param [in] force_on_trashed_table
+  ///   Whether to force to delete a trashed table.
+  /// @param [in] reserve_seconds
+  ///   Reserve seconds after being deleted.
   /// @return Operation status.
   Status DeleteTableInCatalogs(const std::string& table_name,
-                               bool modify_external_catalogs) KUDU_NO_EXPORT;
+                               bool modify_external_catalogs,
+                               bool force_on_trashed_table = false,
+                               uint32_t reserve_seconds = 0) KUDU_NO_EXPORT;
+
+  /// Recall a deleted but still reserved table.
+  ///
+  /// @param [in] table_name
+  ///   Name of the table to recall.
+  /// @return Operation status.
+  Status RecallTable(const std::string& table_id, const std::string& new_table_name = "");
+
   /// @endcond
 
   /// Create a KuduTableAlterer object.
@@ -739,7 +768,8 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Operation status.
   Status ListTabletServers(std::vector<KuduTabletServer*>* tablet_servers);
 
-  /// List only those tables whose names pass a substring match on @c filter.
+  /// List normal tables only those tables whose names pass a substring
+  /// match on @c filter.
   ///
   /// @param [out] tables
   ///   The placeholder for the result. Appended only on success.
@@ -748,6 +778,17 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   /// @return Status object for the operation.
   Status ListTables(std::vector<std::string>* tables,
                     const std::string& filter = "");
+
+  /// List trash tables only those tables whose names pass a substring
+  /// match on @c filter.
+  ///
+  /// @param [out] tables
+  ///   The placeholder for the result. Appended only on success.
+  /// @param [in] filter
+  ///   Substring filter to use; empty sub-string filter matches all tables.
+  /// @return Status object for the operation.
+  Status ListTrashTables(std::vector<std::string>* tables,
+                         const std::string& filter = "");
 
   /// Check if the table given by 'table_name' exists.
   ///
@@ -1021,6 +1062,9 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   FRIEND_TEST(ClientTest, TestWriteWithDeadMaster);
   FRIEND_TEST(MasterFailoverTest, TestPauseAfterCreateTableIssued);
   FRIEND_TEST(MultiTServerClientTest, TestSetReplicationFactor);
+
+  Status GetTables(std::vector<std::string>* tables, const std::string& filter,
+                   bool show_trash);
 
   KuduClient();
 
@@ -2036,6 +2080,17 @@ class KUDU_EXPORT KuduTableAlterer {
   ///   Whether to apply the alteration to external catalogs.
   /// @return Raw pointer to this alterer object.
   KuduTableAlterer* modify_external_catalogs(bool modify_external_catalogs) KUDU_NO_EXPORT;
+
+  /// @cond PRIVATE_API
+
+  /// Force to alter a trashed table.
+  ///
+  /// Private API.
+  ///
+  /// @param [in] force_on_trashed_table
+  ///   Whether to alter on a trashed table.
+  /// @return Raw pointer to this alterer object.
+  KuduTableAlterer* force_on_trashed_table(bool force_on_trashed_table) KUDU_NO_EXPORT;
 
   /// @endcond
 

@@ -22,9 +22,12 @@
 #include <string>
 #include <vector>
 
+#include <gtest/gtest_prod.h>
+
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/kserver/kserver.h"
 #include "kudu/master/master_options.h"
 #include "kudu/util/promise.h"
@@ -36,6 +39,7 @@ class HostPort;
 class MaintenanceManager;
 class MonoDelta;
 class MonoTime;
+class Thread;
 class ThreadPool;
 
 namespace rpc {
@@ -146,6 +150,7 @@ class Master : public kserver::KuduServer {
   friend class MasterTest;
   friend class CatalogManager;
   friend class transactions::TxnManager;
+  FRIEND_TEST(MasterTest, TestIsTableOutdated);
 
   void InitCatalogManagerTask();
   Status InitCatalogManager();
@@ -162,6 +167,11 @@ class Master : public kserver::KuduServer {
   // issue a warning if calling a virtual function from destructor even if it's
   // safe in a particular case.
   void ShutdownImpl();
+
+  // Start thread to delete outdated reserved tables.
+  Status StartOutdatedReservedTablesDeleterThread();
+  void OutdatedReservedTablesDeleterThread();
+  Status DeleteOutdatedReservedTables();
 
   enum MasterState {
     kStopped,
@@ -204,6 +214,8 @@ class Master : public kserver::KuduServer {
   std::unique_ptr<LocationCache> location_cache_;
 
   std::unique_ptr<TSManager> ts_manager_;
+
+  scoped_refptr<Thread> outdated_reserved_tables_deleter_thread_;
 
   DISALLOW_COPY_AND_ASSIGN(Master);
 };

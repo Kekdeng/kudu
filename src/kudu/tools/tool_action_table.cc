@@ -39,11 +39,11 @@
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
-#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
+#include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/value.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
@@ -107,6 +107,11 @@ DEFINE_bool(list_tablets, false,
 DEFINE_bool(show_table_info, false,
             "Include extra information such as number of tablets, replicas, "
             "and live row count for a table in the output");
+DEFINE_bool(show_trash, false,
+            "Show trash tables if set true, otherwise show normal tables.");
+DEFINE_string(new_table_name, "",
+              "The name of the recalled table. "
+              "If the empty string, use the same name as before deletion.");
 DEFINE_bool(modify_external_catalogs, true,
             "Whether to modify external catalogs, such as the Hive Metastore, "
             "when renaming or dropping a table.");
@@ -124,6 +129,10 @@ DEFINE_int32(scan_batch_size, -1,
              "means the server-side default is used, where the server-side "
              "default is controlled by the tablet server's "
              "--scanner_default_batch_size_bytes flag.");
+DEFINE_uint32(reserve_seconds, 604800,
+              "Reserve seconds after being deleted.");
+DEFINE_bool(force_on_trashed_table, false,
+            "Force to alter a trashed table");
 
 DECLARE_bool(row_count_only);
 DECLARE_bool(show_scanner_stats);
@@ -155,7 +164,7 @@ class TableLister {
                                    true /* can_see_all_replicas */));
     vector<kudu::client::KuduClient::Data::TableInfo> tables_info;
     RETURN_NOT_OK(client->data_->ListTablesWithInfo(
-        client.get(), &tables_info, "" /* filter */));
+        client.get(), &tables_info, "" /* filter */, FLAGS_show_trash));
 
     vector<string> table_filters = Split(FLAGS_tables, ",", strings::SkipEmpty());
     for (const auto& tinfo : tables_info) {
@@ -238,7 +247,10 @@ Status DeleteTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(CreateKuduClient(context, &client));
-  return client->DeleteTableInCatalogs(table_name, FLAGS_modify_external_catalogs);
+  return client->DeleteTableInCatalogs(table_name,
+                                       FLAGS_modify_external_catalogs,
+                                       FLAGS_force_on_trashed_table,
+                                       FLAGS_reserve_seconds);
 }
 
 Status DescribeTable(const RunnerContext& context) {
@@ -493,6 +505,13 @@ Status SetRowCountLimit(const RunnerContext& context) {
   return alterer->Alter();
 }
 
+Status RecallTable(const RunnerContext& context) {
+  const string& table_id = FindOrDie(context.required_args, kTabletIdArg);
+  client::sp::shared_ptr<KuduClient> client;
+  RETURN_NOT_OK(CreateKuduClient(context, &client));
+  return client->RecallTable(table_id, FLAGS_new_table_name);
+}
+
 Status RenameTable(const RunnerContext& context) {
   const string& table_name = FindOrDie(context.required_args, kTableNameArg);
   const string& new_table_name = FindOrDie(context.required_args, kNewTableNameArg);
@@ -501,6 +520,7 @@ Status RenameTable(const RunnerContext& context) {
   RETURN_NOT_OK(CreateKuduClient(context, &client));
   unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
   return alterer->RenameTo(new_table_name)
+                ->force_on_trashed_table(FLAGS_force_on_trashed_table)
                 ->modify_external_catalogs(FLAGS_modify_external_catalogs)
                 ->Alter();
 }
@@ -570,8 +590,9 @@ Status SetExtraConfig(const RunnerContext& context) {
   client::sp::shared_ptr<KuduClient> client;
   RETURN_NOT_OK(CreateKuduClient(context, &client));
   unique_ptr<KuduTableAlterer> alterer(client->NewTableAlterer(table_name));
-  alterer->AlterExtraConfig({ { config_name, config_value} });
-  return alterer->Alter();
+  return alterer->AlterExtraConfig({ { config_name, config_value} })
+                ->force_on_trashed_table(FLAGS_force_on_trashed_table)
+                ->Alter();
 }
 
 Status GetExtraConfigs(const RunnerContext& context) {
@@ -1366,7 +1387,9 @@ unique_ptr<Mode> BuildTableMode() {
       ClusterActionBuilder("delete", &DeleteTable)
       .Description("Delete a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to delete" })
+      .AddOptionalParameter("force_on_trashed_table")
       .AddOptionalParameter("modify_external_catalogs")
+      .AddOptionalParameter("reserve_seconds")
       .Build();
 
   unique_ptr<Action> describe_table =
@@ -1379,6 +1402,7 @@ unique_ptr<Mode> BuildTableMode() {
   unique_ptr<Action> list_tables =
       ClusterActionBuilder("list", &ListTables)
       .Description("List tables")
+      .AddOptionalParameter("show_trash")
       .AddOptionalParameter("tables")
       .AddOptionalParameter("list_tablets")
       .AddOptionalParameter("show_table_info")
@@ -1408,11 +1432,20 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kNewColumnNameArg, "New column name" })
       .Build();
 
+  unique_ptr<Action> recall =
+      ActionBuilder("recall", &RecallTable)
+      .Description("Recall a deleted but still reserved table")
+      .AddRequiredParameter({ kMasterAddressesArg, kMasterAddressesArgDesc })
+      .AddRequiredParameter({ kTabletIdArg, "ID of the table to recall" })
+      .AddOptionalParameter("new_table_name")
+      .Build();
+
   unique_ptr<Action> rename_table =
       ClusterActionBuilder("rename_table", &RenameTable)
       .Description("Rename a table")
       .AddRequiredParameter({ kTableNameArg, "Name of the table to rename" })
       .AddRequiredParameter({ kNewTableNameArg, "New table name" })
+      .AddOptionalParameter("force_on_trashed_table")
       .AddOptionalParameter("modify_external_catalogs")
       .Build();
 
@@ -1457,6 +1490,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddRequiredParameter({ kTableNameArg, "Name of the table to alter" })
       .AddRequiredParameter({ kConfigNameArg, "Name of the configuration" })
       .AddRequiredParameter({ kConfigValueArg, "New value for the configuration" })
+      .AddOptionalParameter("force_on_trashed_table")
       .Build();
 
   unique_ptr<Action> get_extra_configs =
@@ -1639,6 +1673,7 @@ unique_ptr<Mode> BuildTableMode() {
       .AddAction(std::move(list_tables))
       .AddAction(std::move(locate_row))
       .AddAction(std::move(rename_column))
+      .AddAction(std::move(recall))
       .AddAction(std::move(rename_table))
       .AddAction(std::move(scan_table))
       .AddAction(std::move(set_comment))

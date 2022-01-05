@@ -150,7 +150,7 @@ public class TestKuduClient {
     assertTrue(client.getTablesList().getTablesList().contains(TABLE_NAME));
 
     // Check that we can delete it.
-    client.deleteTable(TABLE_NAME);
+    client.deleteTable(TABLE_NAME, false, 0);
     assertFalse(client.getTablesList().getTablesList().contains(TABLE_NAME));
 
     // Check that we can re-recreate it, with a different schema.
@@ -170,6 +170,31 @@ public class TestKuduClient {
                  newSchema.getColumn("column3_s").getEncoding());
     assertEquals(ColumnSchema.CompressionAlgorithm.LZ4,
                  newSchema.getColumn("column3_s").getCompressionAlgorithm());
+  }
+
+  /**
+   * Test recalling a trashed table through a KuduClient.
+   */
+  @Test(timeout = 100000)
+  public void testRecallDeletedTable() throws Exception {
+    // Check that we can create a table.
+    assertTrue(client.getTablesList().getTablesList().isEmpty());
+    client.createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
+    assertEquals(1, client.getTablesList().getTablesList().size());
+    assertEquals(TABLE_NAME, client.getTablesList().getTablesList().get(0));
+
+    // Check that we can delete it.
+    client.deleteTable(TABLE_NAME);
+    List<String> tables = client.getTablesList().getTablesList();
+    assertEquals(1, tables.size());
+    String trashedTable = tables.get(0);
+    assertNotEquals(TABLE_NAME, trashedTable);
+    assertTrue(trashedTable, trashedTable.matches("^KUDU_TRASHED:[\\.0-9]+:" + TABLE_NAME));
+
+    // Check that we can recall the trashed table.
+    client.recallDeletedTable(trashedTable);
+    assertEquals(1, client.getTablesList().getTablesList().size());
+    assertEquals(TABLE_NAME, client.getTablesList().getTablesList().get(0));
   }
 
   /**

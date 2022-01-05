@@ -147,7 +147,7 @@ public class TestClientFailoverSupport {
       session.apply(createBasicSchemaInsert(table, i));
     }
     waitUntilRowCount(table, 2 * TOTAL_ROWS_TO_INSERT, DEFAULT_SLEEP);
-    client.deleteTable(TABLE_NAME);
+    client.deleteTable(TABLE_NAME, false, 0);
     assertFalse(client.tableExists(TABLE_NAME));
   }
 }

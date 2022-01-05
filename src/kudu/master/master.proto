@@ -570,9 +570,27 @@ message DeleteTableRequestPB {
   // Whether to apply the deletion to external catalogs, such as the Hive Metastore,
   // which the Kudu master has been configured to integrate with.
   optional bool modify_external_catalogs = 2 [default = true];
+
+  // Reserve seconds after the table has been deleted.
+  optional uint32 reserve_seconds = 3;
+
+  // Force to delete a trashed table.
+  optional bool force_on_trashed_table = 4 [default = false];
 }
 
 message DeleteTableResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+}
+
+message RecallDeletedTableRequestPB {
+  required TableIdentifierPB table = 1;
+
+  // If not null, set table name with this field for the recalled table.
+  optional string new_table_name = 2;
+}
+
+message RecallDeletedTableResponsePB {
   // The error, if an error occurred with this request.
   optional MasterErrorPB error = 1;
 }
@@ -585,6 +603,11 @@ message ListTablesRequestPB {
   // interpreted as if it were set to [TableTypePB::DEFAULT_TABLE], meaning
   // to include only user-defined tables.
   repeated TableTypePB type_filter = 2;
+
+  // Use to select the tables type for display.
+  // Only show normal tables if false.  
+  // Only show trash tables if true.
+  optional bool show_trash = 3;
 }
 
 message ListTablesResponsePB {
@@ -766,6 +789,9 @@ message AlterTableRequestPB {
 
   optional string new_table_comment = 10;
   optional int32 num_replicas = 11;
+
+  // Force to alter a trashed table.
+  optional bool force_on_trashed_table = 12 [default = false];
 }
 
 message AlterTableResponsePB {
@@ -1124,6 +1150,10 @@ service MasterService {
     option (kudu.rpc.authz_method) = "AuthorizeClientOrServiceUser";
   }
   rpc DeleteTable(DeleteTableRequestPB) returns (DeleteTableResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
+
+  rpc RecallDeletedTable(RecallDeletedTableRequestPB) returns (RecallDeletedTableResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
 

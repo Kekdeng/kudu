@@ -211,7 +211,7 @@ public class TestKuduTable {
       // when shutting down the mini cluster at the end of every test class.
       // However, testGetLocations below expects a certain table count, so
       // we'll delete our table to ensure there's no interaction between them.
-      client.deleteTable(tableName);
+      client.deleteTable(tableName, false, 0);
     }
   }
 

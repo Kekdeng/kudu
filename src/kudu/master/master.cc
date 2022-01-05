@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -57,6 +58,7 @@
 #include "kudu/server/webserver.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/maintenance_manager.h"
@@ -64,6 +66,7 @@
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
+#include "kudu/util/thread.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/timer.h"
 #include "kudu/util/version_info.h"
@@ -89,6 +92,11 @@ DEFINE_int64(authz_token_validity_seconds, 60 * 5,
              "Clients will automatically attempt to reacquire a token after the "
              "validity period expires.");
 TAG_FLAG(authz_token_validity_seconds, experimental);
+
+DEFINE_int32(check_outdated_table_interval_seconds, 60,
+             "Interval seconds to check whether there is any trashed table is "
+             "outdated, this kind of table will be deleted and can not be "
+             "recalled later.");
 
 DEFINE_string(location_mapping_cmd, "",
               "A Unix command which takes a single argument, the IP address or "
@@ -169,7 +177,7 @@ Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
   }
   return Status::OK();
 }
-} // anonymous namespace
+}  // anonymous namespace
 
 Master::Master(const MasterOptions& opts)
     : KuduServer("Master", opts, "kudu.master"),
@@ -271,6 +279,7 @@ Status Master::StartAsync() {
     RETURN_NOT_OK(ScheduleTxnManagerInit());
   }
 
+  RETURN_NOT_OK(StartOutdatedReservedTablesDeleterThread());
   state_ = kRunning;
 
   return Status::OK();
@@ -427,6 +436,59 @@ void Master::ShutdownImpl() {
     LOG(INFO) << "Master@" << name << " shutdown complete.";
   }
   state_ = kStopped;
+}
+
+Status Master::StartOutdatedReservedTablesDeleterThread() {
+  return Thread::Create("master",
+                        "outdated-reserved-tables-deleter",
+                        [this]() { this->OutdatedReservedTablesDeleterThread(); },
+                        &outdated_reserved_tables_deleter_thread_);
+}
+
+void Master::OutdatedReservedTablesDeleterThread() {
+  // How often to attempt to delete outdated tables.
+  const MonoDelta kWait = MonoDelta::FromSeconds(FLAGS_check_outdated_table_interval_seconds);
+  while (!stop_background_threads_latch_.WaitUntil(MonoTime::Now() + kWait)) {
+    WARN_NOT_OK(DeleteOutdatedReservedTables(), "Unable to delete outdated reserved tables");
+  }
+}
+
+Status Master::DeleteOutdatedReservedTables() {
+  CatalogManager::ScopedLeaderSharedLock l(catalog_manager());
+  if (!l.first_failed_status().ok()) {
+    // Skip checking if this master is not leader.
+    return Status::OK();
+  }
+
+  ListTablesRequestPB list_req;
+  ListTablesResponsePB list_resp;
+  // Set for trash table map.
+  list_req.set_show_trash(true);
+  RETURN_NOT_OK(catalog_manager_->ListTables(&list_req, &list_resp, boost::none));
+  for (const auto& table : list_resp.tables()) {
+    bool is_trashed_table = false;
+    bool is_outdated_table = false;
+    TableIdentifierPB table_identifier;
+    table_identifier.set_table_name(table.name());
+    Status s = catalog_manager_->IsOutdatedTable(table_identifier,
+               &is_trashed_table, &is_outdated_table,
+               CatalogManager::TableInfoMapType::kTrashTableType);
+    if (!s.ok() || !is_trashed_table || !is_outdated_table) {
+      continue;
+    }
+
+    // Delete the table.
+    DeleteTableRequestPB del_req;
+    del_req.mutable_table()->set_table_id(table.id());
+    del_req.mutable_table()->set_table_name(table.name());
+    del_req.set_reserve_seconds(0);
+    DeleteTableResponsePB del_resp;
+    LOG(INFO) << "Start to delete trashed table " << table.name();
+    WARN_NOT_OK(catalog_manager_->DeleteTableRpc(del_req, &del_resp, nullptr),
+                Substitute("Failed to delete trashed table $0", table.name()));
+  }
+
+  return Status::OK();
 }
 
 Status Master::ListMasters(vector<ServerEntryPB>* masters) const {

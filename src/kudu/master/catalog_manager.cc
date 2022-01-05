@@ -91,6 +91,7 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/sysinfo.h"
 #include "kudu/gutil/utf/utf.h"
@@ -399,6 +400,7 @@ using kudu::consensus::RaftPeerPB;
 using kudu::consensus::StartTabletCopyRequestPB;
 using kudu::consensus::kMinimumTerm;
 using kudu::hms::HmsClientVerifyKuduSyncConfig;
+using kudu::master::TableIdentifierPB;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::RpcContext;
@@ -1500,6 +1502,7 @@ Status CatalogManager::VisitTablesAndTabletsUnlocked() {
 
   // Clear the existing state.
   normalized_table_names_map_.clear();
+  trash_table_names_map_.clear();
   table_ids_map_.clear();
   tablet_map_.clear();
 
@@ -1806,8 +1809,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   Schema client_schema;
   RETURN_NOT_OK(SchemaFromPB(req.schema(), &client_schema));
 
-  RETURN_NOT_OK(SetupError(
-      ValidateClientSchema(normalized_table_name, req.owner(), req.comment(), client_schema),
+  RETURN_NOT_OK(SetupError(ValidateClientSchema(
+      normalized_table_name, req.owner(), req.comment(), client_schema),
       resp, MasterErrorPB::INVALID_SCHEMA));
   if (client_schema.has_column_ids()) {
     return SetupError(Status::InvalidArgument("user requests should not have Column IDs"),
@@ -1917,7 +1920,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
 
   // Verify the table's extra configuration properties.
   TableExtraConfigPB extra_config_pb;
-  RETURN_NOT_OK(ExtraConfigPBFromPBMap(req.extra_configs(), &extra_config_pb));
+  RETURN_NOT_OK(UpdateExtraConfigPB(req.extra_configs(),
+                                    kWithExternalRequest,
+                                    &extra_config_pb));
 
   scoped_refptr<TableInfo> table;
   {
@@ -1925,7 +1930,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     TRACE("Acquired catalog manager lock");
 
     // b. Verify that the table does not exist.
-    table = FindPtrOrNull(normalized_table_names_map_, normalized_table_name);
+    table = FindTableWithName(normalized_table_name);
     if (table != nullptr) {
       return SetupError(Status::AlreadyPresent(Substitute(
               "table $0 already exists with id $1", normalized_table_name, table->id())),
@@ -2085,7 +2090,7 @@ Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+                                          &table, &l, kNormalTableType));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the create is in-progress
@@ -2161,6 +2166,26 @@ scoped_refptr<TabletInfo> CatalogManager::CreateTabletInfo(
   return tablet;
 }
 
+scoped_refptr<TableInfo> CatalogManager::FindTableWithName(const string& table_name,
+                                                           TableInfoMapType map_type) {
+  scoped_refptr<TableInfo> normal_table;
+  scoped_refptr<TableInfo> trash_table;
+  normal_table = FindPtrOrNull(normalized_table_names_map_,
+                               NormalizeTableName(table_name));
+  trash_table = FindPtrOrNull(trash_table_names_map_,
+                              NormalizeTableName(table_name));
+
+  if (map_type == TableInfoMapType::kAllTableType) {
+    return normal_table ? normal_table : trash_table;
+  } else if (map_type == TableInfoMapType::kNormalTableType) {
+    return normal_table;
+  } else if (map_type == TableInfoMapType::kTrashTableType) {
+    return trash_table;
+  } else {
+    return nullptr;
+  }
+}
+
 template<typename ReqClass, typename RespClass, typename F>
 Status CatalogManager::FindLockAndAuthorizeTable(
     const ReqClass& request,
@@ -2169,7 +2194,8 @@ Status CatalogManager::FindLockAndAuthorizeTable(
     F authz_func,
     optional<const string&> user,
     scoped_refptr<TableInfo>* table_info,
-    TableMetadataLock* table_lock) {
+    TableMetadataLock* table_lock,
+    TableInfoMapType map_type) {
   TRACE("Looking up, locking, and authorizing table");
   const TableIdentifierPB& table_identifier = request.table();
 
@@ -2211,15 +2237,14 @@ Status CatalogManager::FindLockAndAuthorizeTable(
 
       // If the request contains both a table ID and table name, ensure that
       // both match the same table.
-      auto table_by_name = FindPtrOrNull(normalized_table_names_map_,
-                                         NormalizeTableName(table_identifier.table_name()));
+      scoped_refptr<TableInfo> table_by_name =
+          FindTableWithName(table_identifier.table_name(), map_type);
       if (table_identifier.has_table_name() &&
           table.get() != table_by_name.get()) {
         table_with_mismatched_name.swap(table_by_name);
       }
     } else if (table_identifier.has_table_name()) {
-      table = FindPtrOrNull(normalized_table_names_map_,
-                            NormalizeTableName(table_identifier.table_name()));
+      table = FindTableWithName(table_identifier.table_name(), map_type);
     } else {
       return SetupError(Status::InvalidArgument("missing table ID or table name"),
                         response, MasterErrorPB::UNKNOWN_ERROR);
@@ -2431,7 +2456,8 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
     {
       TRACE("Removing table from by-name map");
       std::lock_guard<LockType> l_map(lock_);
-      if (normalized_table_names_map_.erase(NormalizeTableName(l.data().name())) != 1) {
+      if ((normalized_table_names_map_.erase(NormalizeTableName(l.data().name())) != 1) &&
+          (trash_table_names_map_.erase(NormalizeTableName(l.data().name())) != 1)) {
         LOG(FATAL) << "Could not remove table " << table->ToString()
                    << " from map in response to DeleteTable request: "
                    << SecureShortDebugString(req);
@@ -2463,8 +2489,33 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
   return Status::OK();
 }
 
+Status CatalogManager::RecallDeletedTableRpc(const RecallDeletedTableRequestPB& req,
+                                             RecallDeletedTableResponsePB* resp,
+                                             rpc::RpcContext* rpc) {
+  leader_lock_.AssertAcquiredForReading();
+
+  string table_name;
+  RETURN_NOT_OK(MoveToNormalContainer(req.table().table_id(), &table_name));
+  AlterTableRequestPB alter_req;
+  alter_req.mutable_table()->set_table_name(table_name);
+  alter_req.mutable_table()->CopyFrom(req.table());
+  if (req.has_new_table_name()) {
+    // Revert table name with new name.
+    alter_req.set_new_table_name(req.new_table_name());
+  }
+  (*alter_req.mutable_new_extra_configs())[kTableMaintenancePriority] = "";
+  (*alter_req.mutable_new_extra_configs())[kTableConfigReserveSeconds] = "";
+  (*alter_req.mutable_new_extra_configs())[kTableConfigTrashStateTimestamp] = "";
+
+  AlterTableResponsePB alter_resp;
+  RETURN_NOT_OK(AlterTableRpc(alter_req, &alter_resp, rpc, kWithoutExternalRequest));
+
+  VLOG(1) << "Recall deleted table " << req.table().table_name();
+  return Status::OK();
+}
+
 Status CatalogManager::ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
-                                             vector<AlterTableRequestPB::Step> steps,
+                                             const vector<AlterTableRequestPB::Step>& steps,
                                              Schema* new_schema,
                                              ColumnId* next_col_id) {
   const SchemaPB& current_schema_pb = current_pb.schema();
@@ -2774,7 +2825,8 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
 Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
                                      AlterTableResponsePB* resp,
-                                     rpc::RpcContext* rpc) {
+                                     rpc::RpcContext* rpc,
+                                     ExternalRequestState external_request_state) {
   leader_lock_.AssertAcquiredForReading();
 
   if (req.modify_external_catalogs()) {
@@ -2870,10 +2922,12 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
 
     return AlterTable(r, resp,
                       /*hms_notification_log_event_id=*/none,
-                      /*user=*/none);
+                      /*user=*/none,
+                      external_request_state);
   }
 
-  return AlterTable(req, resp, /*hms_notification_log_event_id=*/ none, user);
+  return AlterTable(req, resp, /*hms_notification_log_event_id=*/none,
+                    user, external_request_state);
 }
 
 Status CatalogManager::AlterTableHms(const string& table_id,
@@ -2899,7 +2953,8 @@ Status CatalogManager::AlterTableHms(const string& table_id,
   // Use empty user to skip the authorization validation since the operation
   // originates from catalog manager. Moreover, this avoids duplicate effort,
   // because we already perform authorization before making any changes to the HMS.
-  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id, /*user=*/none));
+  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id, /*user=*/none,
+                          /*external_request_state=*/kWithExternalRequest));
 
   // Update the cached HMS notification log event ID.
   DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
@@ -2911,7 +2966,8 @@ Status CatalogManager::AlterTableHms(const string& table_id,
 Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                   AlterTableResponsePB* resp,
                                   optional<int64_t> hms_notification_log_event_id,
-                                  optional<const string&> user) {
+                                  optional<const string&> user,
+                                  ExternalRequestState external_request_state) {
   leader_lock_.AssertAcquiredForReading();
 
   // 1. Group the steps into schema altering steps and partition altering steps.
@@ -3060,7 +3116,6 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   // 4. Validate and try to acquire the new table name.
   string normalized_new_table_name = NormalizeTableName(req.new_table_name());
   if (req.has_new_table_name()) {
-
     // Validate the new table name.
     RETURN_NOT_OK(SetupError(
           ValidateIdentifier(req.new_table_name()).CloneAndPrepend("invalid table name"),
@@ -3155,14 +3210,12 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   if (!req.new_extra_configs().empty()) {
     TRACE("Apply alter extra-config");
     Map<string, string> new_extra_configs;
-    RETURN_NOT_OK(ExtraConfigPBToPBMap(l.data().pb.extra_config(),
-                                       &new_extra_configs));
-    // Merge table's extra configuration properties.
     for (const auto& config : req.new_extra_configs()) {
       new_extra_configs[config.first] = config.second;
     }
-    RETURN_NOT_OK(ExtraConfigPBFromPBMap(new_extra_configs,
-                                         l.mutable_data()->pb.mutable_extra_config()));
+    RETURN_NOT_OK(UpdateExtraConfigPB(new_extra_configs,
+                                      external_request_state,
+                                      l.mutable_data()->pb.mutable_extra_config()));
   }
 
   // Set to true if columns are altered, added or dropped.
@@ -3358,7 +3411,7 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+                                          &table, &l, kNormalTableType));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the alter is in-progress
@@ -3372,7 +3425,8 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
 Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
                                       GetTableSchemaResponsePB* resp,
                                       optional<const string&> user,
-                                      const TokenSigner* token_signer) {
+                                      const TokenSigner* token_signer,
+                                      TableInfoMapType map_type) {
   leader_lock_.AssertAcquiredForReading();
 
   // Lookup the table, verify if it exists, and then check that
@@ -3386,7 +3440,7 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
   RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+                                          &table, &l, map_type));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // If fully_applied_schema is set, use it, since an alter is in progress.
@@ -3433,9 +3487,19 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
 
   vector<scoped_refptr<TableInfo>> tables_info;
   {
+    bool show_trash = false;
+    if (req->has_show_trash()) {
+      show_trash = req->show_trash();
+    }
     shared_lock<LockType> l(lock_);
-    for (const TableInfoMap::value_type &entry : normalized_table_names_map_) {
-      tables_info.emplace_back(entry.second);
+    if (show_trash) {
+      for (const auto& entry : trash_table_names_map_) {
+        tables_info.emplace_back(entry.second);
+      }
+    } else {
+      for (const auto& entry : normalized_table_names_map_) {
+        tables_info.emplace_back(entry.second);
+      }
     }
   }
   unordered_set<int> table_types;
@@ -3472,7 +3536,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       }
     }
     InsertOrUpdate(&table_info_by_name, table_name, table_info);
-    EmplaceIfNotPresent(&table_owner_map, table_name, owner == *user);
+    EmplaceIfNotPresent(&table_owner_map, table_name, user ? owner == *user : true);
   }
 
   MAYBE_INJECT_FIXED_LATENCY(FLAGS_catalog_manager_inject_latency_list_authz_ms);
@@ -3566,7 +3630,7 @@ Status CatalogManager::GetTableStatistics(const GetTableStatisticsRequestPB* req
 }
 
 bool CatalogManager::IsTableWriteDisabled(const scoped_refptr<TableInfo>& table,
-                                          const std::string& table_name) {
+                                          const string& table_name) {
   uint64_t table_disk_size = 0;
   uint64_t table_rows = 0;
   if (table->GetMetrics()->TableSupportsOnDiskSize()) {
@@ -3640,7 +3704,8 @@ Status CatalogManager::TableNameExists(const string& table_name, bool* exists) {
   leader_lock_.AssertAcquiredForReading();
 
   shared_lock<LockType> l(lock_);
-  *exists = ContainsKey(normalized_table_names_map_, NormalizeTableName(table_name));
+  *exists = ContainsKey(normalized_table_names_map_, NormalizeTableName(table_name))
+         || ContainsKey(trash_table_names_map_, NormalizeTableName(table_name));
   return Status::OK();
 }
 
@@ -5915,7 +5980,7 @@ Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
 }
 
 template<typename RespClass>
-Status CatalogManager::ValidateNumberReplicas(const std::string& normalized_table_name,
+Status CatalogManager::ValidateNumberReplicas(const string& normalized_table_name,
                                               RespClass* resp, ValidateType type,
                                               const boost::optional<int>& partitions_count,
                                               int num_replicas) {
@@ -6060,7 +6125,7 @@ void CatalogManager::ResetTableLocationsCache() {
 }
 
 Status CatalogManager::InitiateMasterChangeConfig(ChangeConfigOp op, const HostPort& hp,
-                                                  const std::string& uuid, rpc::RpcContext* rpc) {
+                                                  const string& uuid, rpc::RpcContext* rpc) {
   auto consensus = master_consensus();
   if (!consensus) {
     return Status::IllegalState("Consensus not running");
@@ -6133,6 +6198,99 @@ int CatalogManager::TSInfosDict::LookupOrAdd(const string& uuid,
   });
 }
 
+Status CatalogManager::MoveToTrashContainer(const string& table_name) {
+  TRACE("Moving table from normalized table map to trash table map.");
+  std::lock_guard<LockType> l_map(lock_);
+  auto table = FindPtrOrNull(normalized_table_names_map_,
+                            NormalizeTableName(table_name));
+  if (!table) {
+      return Status::Corruption(Substitute("Table $0 is not exist in normal table map.",
+                                table_name));
+  }
+  if (normalized_table_names_map_.erase(NormalizeTableName(table_name)) != 1) {
+    return Status::Corruption(Substitute("Could not move normal table $0 to trash map",
+                              table_name));
+  }
+  trash_table_names_map_[table_name] = table;
+  return Status::OK();
+}
+
+Status CatalogManager::MoveToNormalContainer(const string& table_id,
+                                             string* table_name) {
+  TRACE("Moving table from trash table map to normalized table map.");
+  std::lock_guard<LockType> l_map(lock_);
+  auto table = FindPtrOrNull(table_ids_map_, table_id);
+  if (!table) {
+      return Status::Corruption(Substitute("Table id $0 is not exist in trash table map.",
+                                table_id));
+  }
+  *table_name = table->table_name();
+  if (trash_table_names_map_.erase(NormalizeTableName(*table_name)) != 1) {
+    return Status::Corruption(Substitute("Could not move trash table $0 to normal map",
+                              *table_name));
+  }
+  normalized_table_names_map_[*table_name] = table;
+  return Status::OK();
+}
+
+Status CatalogManager::IsOutdatedTable(const TableIdentifierPB& table_identifier,
+                                       bool* is_trashed_table,
+                                       bool* is_outdated_table,
+                                       TableInfoMapType map_type) {
+  scoped_refptr<TableInfo> table_info;
+  *is_trashed_table = false;
+  // Confirm the table really exists in manager.
+  {
+    shared_lock<LockType> l(lock_);
+    scoped_refptr<TableInfo> table_by_name;
+    scoped_refptr<TableInfo> table_by_id;
+    if (table_identifier.has_table_name()) {
+      table_by_name = FindTableWithName(table_identifier.table_name(), map_type);
+    }
+    if (table_identifier.has_table_id()) {
+      table_by_id = FindPtrOrNull(table_ids_map_, table_identifier.table_id());
+    }
+
+    bool found = table_by_name || table_by_id;
+    bool table_unique = (table_identifier.has_table_name() && table_identifier.has_table_id())
+                      ? (table_by_name == table_by_id) : true;
+    if (!table_unique || !found) {
+      // This function can only verify non HMS managed tables.
+      // If the table are not found by this, may exist in HMS, so we return directly.
+      // And subsequent functions will go to HMS for confirmation.
+      return Status::OK();
+    }
+    table_info = table_by_name ? table_by_name : table_by_id;
+  }
+
+  GetTableSchemaRequestPB schema_req;
+  schema_req.mutable_table()->set_table_name(table_info->table_name());
+  GetTableSchemaResponsePB schema_resp;
+  RETURN_NOT_OK(GetTableSchema(&schema_req, &schema_resp, boost::none, nullptr, map_type));
+  auto reverse_time = FindOrNull(schema_resp.extra_configs(), kTableConfigReserveSeconds);
+  auto trash_timestamp = FindOrNull(schema_resp.extra_configs(), kTableConfigTrashStateTimestamp);
+  if (!reverse_time || !trash_timestamp) {
+    return Status::OK();
+  }
+
+  *is_trashed_table = true;
+  uint32_t reserve_seconds = 0;
+  if (!safe_strtou32(*reverse_time, &reserve_seconds)) {
+    return Status::Corruption(Substitute("Table $0's config $1 is invalid",
+                              table_info->table_name(), kTableConfigReserveSeconds));
+  }
+  int64_t mark_delete_time;
+  if (!safe_strto64(*trash_timestamp, &mark_delete_time)) {
+    return Status::Corruption(Substitute("Table $0's config $1 is invalid",
+                              table_info->table_name(), kTableConfigTrashStateTimestamp));
+  }
+  if (is_outdated_table) {
+    *is_outdated_table = (static_cast<uint64_t>(WallTime_Now())
+                          - mark_delete_time > reserve_seconds);
+  }
+
+  return Status::OK();
+}
 ////////////////////////////////////////////////////////////
 // CatalogManager::ScopedLeaderSharedLock
 ////////////////////////////////////////////////////////////
@@ -6237,6 +6395,7 @@ INITTED_AND_LEADER_OR_RESPOND(AlterTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ChangeTServerStateResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(CreateTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(DeleteTableResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(RecallDeletedTableResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsAlterTableDoneResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(IsCreateTableDoneResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(ListTablesResponsePB);
@@ -6362,6 +6521,11 @@ TableInfo::~TableInfo() {
 string TableInfo::ToString() const {
   TableMetadataLock l(this, LockMode::READ);
   return Substitute("$0 [id=$1]", l.data().pb.name(), table_id_);
+}
+
+string TableInfo::table_name() const {
+  TableMetadataLock l(this, LockMode::READ);
+  return Substitute("$0", l.data().pb.name());
 }
 
 uint32_t TableInfo::schema_version() const {
@@ -6666,7 +6830,7 @@ void TableInfo::UpdateMetrics(const string& tablet_id,
   }
 }
 
-void TableInfo::InvalidateMetrics(const std::string& tablet_id) {
+void TableInfo::InvalidateMetrics(const string& tablet_id) {
   if (!metrics_) return;
   if (!metrics_->ContainsTabletNoOnDiskSize(tablet_id)) {
     metrics_->AddTabletNoOnDiskSize(tablet_id);
